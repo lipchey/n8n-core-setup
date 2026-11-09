@@ -1,0 +1,69 @@
+#!/bin/bash
+# Pre-commit hook.
+# (1) Block staged files with secret-file extensions (defense-in-depth;
+#     .gitignore covers these but `git add -f` can override it).
+# (2) Block staged content containing PEM private-key headers or raw age
+#     secret keys.
+
+# --- (1) Dangerous file-extension check ---
+_DANGEROUS=$(git diff --cached --name-only --diff-filter=ACMR \
+  | grep -Ei '\.(pem|key|age|dec|p12|pfx)$' || true)
+if [ -n "$_DANGEROUS" ]; then
+  echo "❌ Refusing commit: staged files have secret-file extensions:" >&2
+  printf '   %s\n' "$_DANGEROUS" >&2
+  exit 1
+fi
+
+# --- (1b) Local secret env files — `git add -f` bypasses .gitignore ---
+_ENV_BLOCKED=$(git diff --cached --name-only --diff-filter=ACMR \
+  | grep -E '(^|/)\.env$|(^|/)\.env\.(developer|local)$|(^|/)\.mcp\.json$|(^|/)\.codex/config\.toml$' || true)
+if [ -n "$_ENV_BLOCKED" ]; then
+  echo "❌ Refusing commit: staged local secret files (use .env.sops.yaml for secrets):" >&2
+  printf '   %s\n' "$_ENV_BLOCKED" >&2
+  exit 1
+fi
+
+# --- (2) PEM / age private-key content scan ---
+# Skipped for: scanner scripts (embed patterns as test fixtures) and
+# any file under .claude/ or with a .md extension (patterns appear in docs).
+_STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)
+_FOUND=0
+while IFS= read -r _f; do
+  [ -n "$_f" ] || continue
+  case "$_f" in
+    *.md|.claude/*|.githooks/*|n8n/scripts/scan-workflow-secrets*) continue ;;
+  esac
+  if git diff --cached -- "$_f" \
+       | grep '^+' | grep -v '^+++' \
+       | grep -qEi -e '-----BEGIN (RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY' -e 'AGE-SECRET-KEY-1'
+  then
+    echo "❌ Refusing commit: $_f contains a private-key marker." >&2
+    _FOUND=1
+  fi
+done <<< "$_STAGED"
+[ "$_FOUND" = 0 ] || { echo "   Remove the key before committing." >&2; exit 1; }
+
+[ "${N8N_SKIP_CUSTOM_NODES_GATE:-false}" != true ] || exit 0
+
+# --- (3) Custom-nodes typecheck + lint gate ---
+# Only runs when staged changes touch n8n/custom-nodes/ source. Skips when only
+# dist/ or node_modules/ are touched (shouldn't happen — both are gitignored).
+_NODES_CHANGED=$(printf '%s\n' "$_STAGED" \
+  | grep -E '^n8n/custom-nodes/' \
+  | grep -Ev '^n8n/custom-nodes/(dist|node_modules)/' || true)
+if [ -n "$_NODES_CHANGED" ]; then
+  if [ ! -d n8n/custom-nodes/node_modules ]; then
+    echo "❌ n8n/custom-nodes/node_modules missing — run: npm run nodes:install" >&2
+    exit 1
+  fi
+  echo "▶ custom-nodes typecheck…" >&2
+  if ! (cd n8n/custom-nodes && npx --no-install tsc --noEmit) >&2; then
+    echo "   Fix TypeScript errors or bypass with: git commit --no-verify" >&2
+    exit 1
+  fi
+  echo "▶ custom-nodes lint…" >&2
+  if ! (cd n8n/custom-nodes && npm run --silent lint) >&2; then
+    echo "   Fix lint errors (try: cd n8n/custom-nodes && npm run lintfix) or bypass with --no-verify" >&2
+    exit 1
+  fi
+fi

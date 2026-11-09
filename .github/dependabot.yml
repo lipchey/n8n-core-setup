@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Bumps SHA-pinned Actions so the pins don't go stale on security fixes.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+  - package-ecosystem: npm
+    directory: /n8n/custom-nodes
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(nodes)"

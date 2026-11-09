@@ -1,0 +1,38 @@
+{
+  "name": "n8n-core-setup",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lipchey/n8n-core-setup"
+  },
+  "author": {
+    "name": "Yuriy Lipchey",
+    "email": "yuriy.lipchey.work@gmail.com"
+  },
+  "scripts": {
+    "start": "bash -c 'source .env.config && if [ -n \"$N8N_COMMON_DOMAIN\" ]; then open \"https://$PROJECT_NAME.$N8N_COMMON_DOMAIN\"; else open \"https://$N8N_PROJECTS_DOMAIN\"; fi'",
+    "pull": "bash n8n/scripts/sync-workflows.sh --pull",
+    "nodes:install": "cd n8n/custom-nodes && npm install",
+    "nodes:build": "cd n8n/custom-nodes && npm run build",
+    "nodes:dev": "cd n8n/custom-nodes && npm run dev",
+    "nodes:lint": "cd n8n/custom-nodes && npm run lint",
+    "backup-database": "bash n8n/scripts/trigger-remote-script.sh database/backup-database.sh",
+    "restore-database": "bash n8n/scripts/trigger-remote-script.sh database/restore-database.sh",
+    "prune-backblaze": "bash scripts/prune-backblaze.sh",
+    "push:watch": "bash scripts/watch-deploy.sh",
+    "init-digital-ocean": "bash scripts/init-digitalocean.sh",
+    "init-hetzner": "bash scripts/init-hetzner.sh",
+    "initialize": "bash scripts/initialize.sh",
+    "check-prerequisites": "bash scripts/check-prerequisites.sh",
+    "initialize:hard-reset": "bash scripts/initialize.sh --hard-reset",
+    "encrypt-env": "bash scripts/sops-env.sh --encrypt",
+    "decrypt-env": "bash scripts/sops-env.sh --decrypt",
+    "edit-env": "bash -c '[ ! -e .env ] || { echo \".env already exists: encrypt or remove it first, edit-env would overwrite it\" >&2; exit 1; }; bash scripts/sops-env.sh --decrypt && \"${EDITOR:-nano}\" .env && bash scripts/sops-env.sh --encrypt'",
+    "init-cloudflare": "bash scripts/cloudflare/init-cloudflare.sh",
+    "refresh-images": "bash scripts/refresh-image-pins.sh",
+    "test": "bash scripts/test-environment.sh",
+    "test:unit": "bash n8n/scripts/scan-workflow-secrets.test.sh && bash n8n/scripts/vps-runtime.test.sh && bash scripts/test-validate-config.sh && bash scripts/test-prompts.sh && bash scripts/test-check-prerequisites.sh && python3 scripts/test-prebilling.py && python3 scripts/test-refresh-image-pins.py && python3 scripts/test-wizard.py && python3 scripts/test-setup-docs.py && python3 scripts/generate-setup-docs.py --check && python3 scripts/test-initialized-instance.py"
+  }
+}

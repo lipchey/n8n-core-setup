@@ -1,0 +1,155 @@
+networks:
+  project_network:
+
+# Cap json-file logs so a chatty container can't fill the VPS disk between log-rotation cycles.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    # Bump via: npm run refresh-images
+    image: postgres:16.14-alpine@sha256:79950da386bda7fcc9d57aa9aa9be6c6d7407596a9b8f68014b09a778a9ab316
+    container_name: n8n_postgres
+    restart: always
+    logging: *default-logging
+    environment:
+      - POSTGRES_USER=${DB_USER:?DB_USER must be set}
+      - POSTGRES_PASSWORD=${DB_PASSWORD:?DB_PASSWORD must be set}
+      - POSTGRES_DB=${DB_NAME:?DB_NAME must be set}
+    volumes:
+      - db_storage:/var/lib/postgresql/data
+    networks:
+      - project_network
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      # Entrypoint runs as root → chowns data dir → drops to postgres user.
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEM_LIMIT:-512m}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${DB_USER} -d ${DB_NAME}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  n8n:
+    # Bump via: npm run refresh-images
+    image: n8nio/n8n:2.21.3@sha256:23005738b8539e34c13986f8d2c76c2ac540a89a318cbc5481aae89265a28c93
+    container_name: n8n_app
+    restart: always
+    logging: *default-logging
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${DB_NAME:?DB_NAME must be set}
+      - DB_POSTGRESDB_USER=${DB_USER:?DB_USER must be set}
+      - DB_POSTGRESDB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD must be set}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY:?N8N_ENCRYPTION_KEY must be set}
+      - WEBHOOK_URL=${WEBHOOK_URL}
+
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=${EXECUTIONS_MAX_AGE:-1440}
+      - EXECUTIONS_DATA_PRUNE_MAX_COUNT=${EXECUTIONS_MAX_COUNT:-35000}
+      # Operational time is UTC everywhere (storage, $now, execution metadata, logs)
+      # so debug surfaces line up. Local time is applied only at display edges.
+      - GENERIC_TIMEZONE=UTC
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+      - N8N_RESTRICT_FILE_ACCESS_TO=/home/node/.n8n-files;/home/node/.n8n-ai-system-prompts
+      # Project-local nodes & credentials, built in CI from n8n/custom-nodes/ into ./custom-nodes/dist on the VPS.
+      - N8N_CUSTOM_EXTENSIONS=/home/node/.n8n-custom
+      - HEALTH_PING_URL=${HEALTH_PING_URL:-}
+      - PROJECT_NAME=${PROJECT_NAME}
+      - DEVELOPER_EMAIL=${DEVELOPER_EMAIL}
+      - RESEND_API_KEY=${RESEND_API_KEY}
+      - RESEND_FROM_EMAIL=${RESEND_FROM_EMAIL}
+
+      # Alert and health workflows need environment access until they use n8n Credentials.
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - N8N_METRICS=false
+
+      - N8N_LOG_LEVEL=${N8N_LOG_LEVEL:-info}
+    volumes:
+      - n8n_storage:/home/node/.n8n
+      # Persists files written by Read/Write File nodes — the path n8n is sandboxed to via N8N_RESTRICT_FILE_ACCESS_TO sits outside .n8n/.
+      - n8n_files:/home/node/.n8n-files
+      # Built artifacts (CI: cd n8n/custom-nodes && npm ci && npm run build && npm prune --omit=dev).
+      # Read-only: n8n only loads from here, never writes back.
+      - ./custom-nodes:/home/node/.n8n-custom/local:ro
+      # AI System prompts mounted from git repo
+      - ./ai-system-prompts:/home/node/.n8n-ai-system-prompts:ro
+    ports:
+      - "127.0.0.1:5678:5678"
+    networks:
+      - project_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: ${N8N_MEM_LIMIT:-1g}
+    healthcheck:
+      # /healthz/readiness verifies DB too — /healthz alone misses dead DB.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz/readiness || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      # A failed check during a long DB migration must not mark n8n unhealthy.
+      start_period: 300s
+
+  cloudflared:
+    # Bump via: npm run refresh-images
+    image: cloudflare/cloudflared:2026.10.4@sha256:c6c7ae1d5dfdcb094ad344ed68ccffc26635c9c6be80965664c33baf064b0515
+    container_name: n8n_cloudflared
+    restart: always
+    logging: *default-logging
+    # --metrics exposes /ready inside the container for the healthcheck below.
+    command: tunnel --metrics 127.0.0.1:2000 run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    networks:
+      - project_network
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: ${CLOUDFLARED_MEM_LIMIT:-128m}
+    depends_on:
+      n8n:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:2000", "ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+
+volumes:
+  db_storage:
+    name: n8n_db_storage
+  n8n_storage:
+    name: n8n_app_storage
+  n8n_files:
+    name: n8n_app_files

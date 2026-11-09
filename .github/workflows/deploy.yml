@@ -1,0 +1,486 @@
+name: Deploy n8n
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  # One VPS target — serialize ALL deploys, not per-ref.
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+  deploy:
+    needs: unit-tests
+    # scp runs with rm:false, so another branch's files would stay on the VPS after its deploy.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    # Lifecycle step can legitimately take 40m (two lock waits + --wait) on top of build and upload.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect Changed Files
+        id: changes
+        run: |
+          if [ ! -f .env.config ]; then
+            echo "deploy_mode=skip" >> "$GITHUB_OUTPUT"
+            echo "::notice::No .env.config in this repo (unconfigured template): skipping deploy. Run 'npm run initialize' to configure it."
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "deploy_mode=full" >> "$GITHUB_OUTPUT"
+            echo "-> Manual dispatch: running full deploy"
+            exit 0
+          fi
+          # Diff the WHOLE pushed range (before..HEAD), not just the tip commit —
+          # a doc-only tip commit must not mask code changes in earlier commits
+          # of the same push.
+          BEFORE="${{ github.event.before }}"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] || ! git rev-parse --verify -q "${BEFORE}^{commit}" >/dev/null; then
+            echo "deploy_mode=full" >> "$GITHUB_OUTPUT"
+            echo "-> No valid before-SHA (new branch / force-push / initial): running full deploy"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BEFORE" HEAD)
+          echo "Changed files:"
+          echo "$CHANGED"
+          # Workflow JSONs removed in this push → hard-delete them in n8n. Resolve
+          # each deleted file's .name at BEFORE (it's gone at HEAD). Stays empty on
+          # dispatch / new-branch (those exit above with no valid BEFORE = no auto-delete).
+          DELETED_WF_NAMES=""
+          while IFS=$'\t' read -r _st _path; do
+            case "$_path" in *.json) ;; *) continue ;; esac
+            _nm=$(git show "$BEFORE:$_path" 2>/dev/null | jq -r '.name // empty' 2>/dev/null)
+            [ -n "$_nm" ] && DELETED_WF_NAMES="${DELETED_WF_NAMES:+$DELETED_WF_NAMES;}$_nm"
+          done < <(git diff --name-status --no-renames --diff-filter=D "$BEFORE" HEAD -- n8n/workflows/)
+          # An in-place .name change (modified file, same path) orphans the old
+          # workflow in n8n — push matches by name and creates a new one. Delete
+          # the old name too (sync only deletes names absent from every local file).
+          while IFS=$'\t' read -r _st _path; do
+            case "$_path" in *.json) ;; *) continue ;; esac
+            _old=$(git show "$BEFORE:$_path" 2>/dev/null | jq -r '.name // empty' 2>/dev/null)
+            _new=$(jq -r '.name // empty' "$_path" 2>/dev/null)
+            [ -n "$_old" ] && [ "$_old" != "$_new" ] && DELETED_WF_NAMES="${DELETED_WF_NAMES:+$DELETED_WF_NAMES;}$_old"
+          done < <(git diff --name-status --no-renames --diff-filter=M "$BEFORE" HEAD -- n8n/workflows/)
+          echo "deleted_workflows=$DELETED_WF_NAMES" >> "$GITHUB_OUTPUT"
+          [ -n "$DELETED_WF_NAMES" ] && echo "-> Workflows removed in this push (will delete in n8n): $DELETED_WF_NAMES"
+          DEPLOY_RELEVANT=$(echo "$CHANGED" | grep -Ev '\.(md|txt)$|^\.claude/|^\.agent/|^\.vscode/|^\.idea/|^\.githooks/|^\.codex/|^LICENSE|^\.gitignore$|^package(-lock)?\.json$|^scripts/|^\.github/dependabot\.yml$|^\.github/workflows/ci\.yml$|^\.env\.example$|^\.env\.developer\.example$|^\.sops\.yaml$' || true)
+          PROMPTS_CHANGED=$(echo "$CHANGED" | grep -E '^n8n/ai-system-prompts/.*\.(md|txt)$' || true)
+          if [ -n "$PROMPTS_CHANGED" ]; then
+            DEPLOY_RELEVANT="${DEPLOY_RELEVANT}"$'\n'"${PROMPTS_CHANGED}"
+          fi
+          if [ -z "$DEPLOY_RELEVANT" ]; then
+            echo "deploy_mode=skip" >> "$GITHUB_OUTPUT"
+            echo "-> Only non-runtime files changed: skipping deploy"
+          elif [ -z "$(echo "$DEPLOY_RELEVANT" | grep -Ev '^n8n/workflows/|^n8n/ai-system-prompts/' || true)" ]; then
+            echo "deploy_mode=workflows" >> "$GITHUB_OUTPUT"
+            echo "-> Only workflow and prompt files changed: skipping Docker rebuild"
+          else
+            echo "deploy_mode=full" >> "$GITHUB_OUTPUT"
+            echo "-> Non-workflow files detected: running full deploy"
+          fi
+
+      # Pin Node so a runner image bump can't silently break custom-nodes build.
+      - name: Setup Node.js
+        if: steps.changes.outputs.deploy_mode == 'full' && hashFiles('n8n/custom-nodes/package.json') != ''
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '22'
+
+      - name: Build custom n8n nodes
+        if: steps.changes.outputs.deploy_mode == 'full' && hashFiles('n8n/custom-nodes/package.json') != ''
+        working-directory: n8n/custom-nodes
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+          # Keep only runtime deps in node_modules so SCP'd payload is minimal.
+          npm prune --omit=dev --ignore-scripts
+
+      - name: Load repo .env.config into environment
+        if: steps.changes.outputs.deploy_mode != 'skip'
+        run: |
+          # Untrusted committed plaintext: HTTPS_PROXY-style keys hijack later downloads, and root cron `source`s the values, where $(cmd) runs.
+          while IFS= read -r line; do
+            key="${line%%=*}"; val="${line#*=}"
+            case "$key" in
+              PROJECT_NAME|DISPLAY_TZ|DEVELOPER_EMAIL|GITHUB_REPO|GITHUB_BRANCH|N8N_COMMON_DOMAIN|N8N_PROJECTS_DOMAIN|CLOUDFLARE_ACCOUNT_ID|POSTGRES_MEM_LIMIT|N8N_MEM_LIMIT|CLOUDFLARED_MEM_LIMIT|EXECUTIONS_MAX_AGE|EXECUTIONS_MAX_COUNT|ALERT_DISK_THRESHOLD_MEDIUM|ALERT_DISK_THRESHOLD_HIGH|BACKBLAZE_BUCKET) ;;
+              N8N_ENCRYPTION_KEY|N8N_API_KEY|N8N_LOCAL_API_URL|N8N_LOG_LEVEL|DB_USER|DB_PASSWORD|DB_NAME|BACKUP_PASSWORD|RESEND_API_KEY|RESEND_FROM_EMAIL|HEALTH_PING_URL|BACKBLAZE_KEY_ID|BACKBLAZE_APPLICATION_KEY|GITHUB_PERSONAL_ACCESS_TOKEN|N8N_VPS_USER|N8N_VPS_IP|N8N_VPS_HOST_FINGERPRINT|CLOUDFLARE_API_TOKEN|CF_ACCESS_CLIENT_ID|CF_ACCESS_CLIENT_SECRET|DIGITAL_OCEAN_API_TOKEN|HETZNER_API_TOKEN) ;;
+              *) echo "❌ .env.config: key '$key' is not in the deploy allowlist — add it to deploy.yml if it is legitimate" >&2; exit 1 ;;
+            esac
+            if [[ "$val" =~ [^A-Za-z0-9@._:/+=,-] ]]; then
+              echo "❌ .env.config: value for '$key' has chars outside [A-Za-z0-9@._:/+=,-] — refusing (unsafe when sourced as shell)" >&2; exit 1
+            fi
+            printf '%s=%s\n' "$key" "$val" >> "$GITHUB_ENV"
+          done < <(sed 's/\r//' .env.config | grep -E '^[A-Za-z_][A-Za-z0-9_]*=')
+
+      - name: Install sops + age
+        if: steps.changes.outputs.deploy_mode != 'skip'
+        run: |
+          # Checksum-verified install: MITM/compromised release would otherwise leak SOPS_AGE_KEY.
+          SOPS_VERSION=3.9.4
+          SOPS_SHA256=5488e32bc471de7982ad895dd054bbab3ab91c417a118426134551e9626e4e85
+          curl -fsSL "https://github.com/getsops/sops/releases/download/v${SOPS_VERSION}/sops-v${SOPS_VERSION}.linux.amd64" \
+            -o "/tmp/sops-v${SOPS_VERSION}.linux.amd64"
+          echo "${SOPS_SHA256}  /tmp/sops-v${SOPS_VERSION}.linux.amd64" | sha256sum -c -
+          mv "/tmp/sops-v${SOPS_VERSION}.linux.amd64" /usr/local/bin/sops
+          chmod +x /usr/local/bin/sops
+          # age v1.2+ dropped checksums.txt — hardcode SHA256. To bump:
+          # curl -fsSL <tarball-url> | sha256sum
+          AGE_VERSION=1.2.1
+          AGE_SHA256=7df45a6cc87d4da11cc03a539a7470c15b1041ab2b396af088fe9990f7c79d50
+          curl -fsSL "https://github.com/FiloSottile/age/releases/download/v${AGE_VERSION}/age-v${AGE_VERSION}-linux-amd64.tar.gz" \
+            -o "/tmp/age-v${AGE_VERSION}-linux-amd64.tar.gz"
+          echo "${AGE_SHA256}  /tmp/age-v${AGE_VERSION}-linux-amd64.tar.gz" | sha256sum -c -
+          tar -xz -C /tmp -f "/tmp/age-v${AGE_VERSION}-linux-amd64.tar.gz" age/age age/age-keygen
+          mv /tmp/age/age /tmp/age/age-keygen /usr/local/bin/
+
+      - name: Decrypt .env.sops.yaml
+        if: steps.changes.outputs.deploy_mode != 'skip'
+        id: sops-decrypt
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+        run: |
+          KEY_FILE=~/.config/sops/age/keys.txt
+          ENV_DEC=$(mktemp)
+          chmod 600 "$ENV_DEC"
+          trap 'rm -f "$ENV_DEC" "$KEY_FILE"' EXIT
+          mkdir -p "$(dirname "$KEY_FILE")"
+          printf '%s' "$SOPS_AGE_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          sops --input-type dotenv --output-type dotenv -d .env.sops.yaml > "$ENV_DEC"
+          rm -f "$KEY_FILE"
+          trap - EXIT
+          echo "env_dec=$ENV_DEC" >> "$GITHUB_OUTPUT"
+
+      - name: Load decrypted secrets into environment
+        if: steps.changes.outputs.deploy_mode != 'skip'
+        run: |
+          # A key a later step consumes must be listed here, or it reaches the VPS empty.
+          ENV_DEC="${{ steps.sops-decrypt.outputs.env_dec }}"
+          cat "$ENV_DEC" \
+            | sed 's/\r//' \
+            | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' \
+            | while IFS= read -r line; do
+                case "${line%%=*}" in
+                  PROJECT_NAME|DISPLAY_TZ|DEVELOPER_EMAIL|GITHUB_REPO|GITHUB_BRANCH|POSTGRES_MEM_LIMIT|N8N_MEM_LIMIT|CLOUDFLARED_MEM_LIMIT|EXECUTIONS_MAX_AGE|EXECUTIONS_MAX_COUNT|ALERT_DISK_THRESHOLD_MEDIUM|ALERT_DISK_THRESHOLD_HIGH|BACKBLAZE_BUCKET) ;;
+                  N8N_ENCRYPTION_KEY|N8N_API_KEY|N8N_LOCAL_API_URL|N8N_LOG_LEVEL|DB_USER|DB_PASSWORD|DB_NAME|BACKUP_PASSWORD|RESEND_API_KEY|RESEND_FROM_EMAIL|HEALTH_PING_URL|BACKBLAZE_KEY_ID|BACKBLAZE_APPLICATION_KEY|GITHUB_PERSONAL_ACCESS_TOKEN|N8N_VPS_USER|N8N_VPS_IP|N8N_VPS_HOST_FINGERPRINT) ;;
+                  *) continue ;;
+                esac
+                echo "$line" >> "$GITHUB_ENV"
+                val="${line#*=}"
+                [ -n "$val" ] && echo "::add-mask::$val"
+              done
+          rm -f "$ENV_DEC"
+
+      - name: Validate required config
+        if: steps.changes.outputs.deploy_mode != 'skip'
+        run: |
+          : "${DISPLAY_TZ:?DISPLAY_TZ must be set in .env.config — operator display zone (operational time is UTC)}"
+          : "${PROJECT_NAME:?PROJECT_NAME must be set in .env.config}"
+          : "${N8N_VPS_IP:?N8N_VPS_IP missing from .env.sops.yaml — run 'npm run edit-env' locally to add it, then commit}"
+          : "${N8N_VPS_USER:?N8N_VPS_USER missing from .env.sops.yaml — run 'npm run edit-env' locally to add it, then commit}"
+          for _var in DB_USER DB_PASSWORD DB_NAME N8N_ENCRYPTION_KEY N8N_API_KEY N8N_LOCAL_API_URL BACKUP_PASSWORD GITHUB_PERSONAL_ACCESS_TOKEN; do
+            [ -n "${!_var:-}" ] || { echo "❌ $_var missing from .env.sops.yaml — run 'npm run edit-env' locally to add it, then commit" >&2; exit 1; }
+          done
+          : "${GITHUB_REPO:?GITHUB_REPO must be set in .env.config}"
+          # DISPLAY_TZ + PROJECT_NAME are interpolated into sed/heredoc — reject metacharacters.
+          if ! [[ "$DISPLAY_TZ" =~ ^[A-Za-z_]+(/[A-Za-z0-9_+-]+){0,2}$ ]]; then
+            echo "❌ DISPLAY_TZ='$DISPLAY_TZ' is not a valid IANA timezone (expected e.g. 'America/New_York', 'America/Argentina/Buenos_Aires')." >&2
+            exit 1
+          fi
+          if ! [[ "$PROJECT_NAME" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]]; then
+            echo "❌ PROJECT_NAME='$PROJECT_NAME' must be lowercase alphanumeric with hyphens, 1–31 chars, start with a letter or digit." >&2
+            exit 1
+          fi
+
+
+      - name: Derive WEBHOOK_URL
+        if: steps.changes.outputs.deploy_mode != 'skip'
+        run: |
+          if [ -n "${N8N_COMMON_DOMAIN}" ] && [ -n "${N8N_PROJECTS_DOMAIN}" ]; then
+            echo "❌ Set only one of N8N_COMMON_DOMAIN or N8N_PROJECTS_DOMAIN in .env.config, not both." >&2
+            exit 1
+          elif [ -n "${N8N_COMMON_DOMAIN}" ]; then
+            printf 'WEBHOOK_URL=https://%s.%s\n' "${PROJECT_NAME}" "${N8N_COMMON_DOMAIN}" >> "$GITHUB_ENV"
+          elif [ -n "${N8N_PROJECTS_DOMAIN}" ]; then
+            printf 'WEBHOOK_URL=https://%s\n' "${N8N_PROJECTS_DOMAIN}" >> "$GITHUB_ENV"
+          else
+            echo "❌ Set either N8N_COMMON_DOMAIN or N8N_PROJECTS_DOMAIN in .env.config." >&2
+            exit 1
+          fi
+
+      - name: Prepare Remote Environment
+        if: steps.changes.outputs.deploy_mode == 'full'
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+        with:
+          host: ${{ env.N8N_VPS_IP }}
+          username: ${{ env.N8N_VPS_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          fingerprint: ${{ env.N8N_VPS_HOST_FINGERPRINT }}
+          command_timeout: 20m
+          script: |
+            mkdir -p ~/n8n/workflows ~/n8n/ai-system-prompts
+            rm -f ~/n8n/workflows/*.json
+            rm -f ~/n8n/ai-system-prompts/*.md ~/n8n/ai-system-prompts/*.txt
+
+      - name: Sync Project Files
+        if: steps.changes.outputs.deploy_mode == 'full'
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345  # v1.0.0
+        with:
+          host: ${{ env.N8N_VPS_IP }}
+          username: ${{ env.N8N_VPS_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          fingerprint: ${{ env.N8N_VPS_HOST_FINGERPRINT }}
+          command_timeout: 20m
+          source: "n8n/*"
+          target: "~/"
+          strip_components: 0
+          rm: false
+
+      - name: Execute Container Lifecycle & Ingest Workflows
+        if: steps.changes.outputs.deploy_mode == 'full'
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+        env:
+          # Everything else flows from $GITHUB_ENV into the action's process env
+          # (the envs: list below); step outputs are the only values that don't.
+          DELETED_WORKFLOWS: ${{ steps.changes.outputs.deleted_workflows }}
+        with:
+          host: ${{ env.N8N_VPS_IP }}
+          username: ${{ env.N8N_VPS_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          fingerprint: ${{ env.N8N_VPS_HOST_FINGERPRINT }}
+          command_timeout: 40m
+          envs: PROJECT_NAME,DISPLAY_TZ,N8N_ENCRYPTION_KEY,N8N_API_KEY,WEBHOOK_URL,N8N_LOCAL_API_URL,DB_USER,DB_PASSWORD,DB_NAME,BACKUP_PASSWORD,GITHUB_PERSONAL_ACCESS_TOKEN,GITHUB_REPO,GITHUB_BRANCH,POSTGRES_MEM_LIMIT,N8N_MEM_LIMIT,CLOUDFLARED_MEM_LIMIT,EXECUTIONS_MAX_AGE,EXECUTIONS_MAX_COUNT,BACKBLAZE_KEY_ID,BACKBLAZE_APPLICATION_KEY,BACKBLAZE_BUCKET,ALERT_DISK_THRESHOLD_MEDIUM,ALERT_DISK_THRESHOLD_HIGH,RESEND_API_KEY,RESEND_FROM_EMAIL,HEALTH_PING_URL,DEVELOPER_EMAIL,N8N_LOG_LEVEL,DELETED_WORKFLOWS
+          script: |
+            cd ~/n8n
+
+            # Close the create→chmod race on .env / .backup_creds.
+            umask 077
+
+            # No `set -e` here (many lines legitimately return non-zero), so guard each step
+            # whose failure must block the deploy — else a failed step ships a green deploy.
+            die() { echo "❌ deploy: $*" >&2; exit 1; }
+
+            # Same order in every holder or they can deadlock. Earlier cleanup/SCP steps are separate SSH sessions and stay unlocked.
+            exec 8>/root/n8n/.backup.lock || die "cannot open backup lock"
+            flock -w 600 8 || die "backup/restore still running after 10 min — retry the deploy"
+            exec 9>/root/n8n/.poll-publish.lock || die "cannot open poll lock"
+            flock -w 600 9 || die "publish poll still running after 10 min — retry the deploy"
+
+            TUNNEL_TOKEN=$(grep '^TUNNEL_TOKEN=' .backup_creds 2>/dev/null | cut -d= -f2-)
+            if [ -z "$TUNNEL_TOKEN" ]; then
+              echo "❌ TUNNEL_TOKEN not found in .backup_creds — run npm run initialize first." >&2
+              exit 1
+            fi
+
+            # printf %s=%s is safe — value is never shell-parsed.
+            {
+              printf 'PROJECT_NAME=%s\n'        "${PROJECT_NAME}"
+              printf 'DISPLAY_TZ=%s\n'         "${DISPLAY_TZ}"
+              printf 'N8N_ENCRYPTION_KEY=%s\n' "${N8N_ENCRYPTION_KEY}"
+              printf 'N8N_API_KEY=%s\n'        "${N8N_API_KEY}"
+              printf 'WEBHOOK_URL=%s\n'        "${WEBHOOK_URL}"
+              printf 'N8N_LOCAL_API_URL=%s\n'  "${N8N_LOCAL_API_URL}"
+              printf 'DB_USER=%s\n'            "${DB_USER}"
+              printf 'DB_PASSWORD=%s\n'        "${DB_PASSWORD}"
+              printf 'DB_NAME=%s\n'            "${DB_NAME}"
+              printf 'BACKUP_PASSWORD=%s\n'    "${BACKUP_PASSWORD}"
+              printf 'TUNNEL_TOKEN=%s\n'       "${TUNNEL_TOKEN}"
+              printf 'GITHUB_PERSONAL_ACCESS_TOKEN=%s\n'   "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+              printf 'GITHUB_REPO=%s\n'        "${GITHUB_REPO}"
+              printf 'GITHUB_BRANCH=%s\n'      "${GITHUB_BRANCH}"
+              printf 'POSTGRES_MEM_LIMIT=%s\n' "${POSTGRES_MEM_LIMIT:-512m}"
+              printf 'N8N_MEM_LIMIT=%s\n'      "${N8N_MEM_LIMIT:-1g}"
+              printf 'CLOUDFLARED_MEM_LIMIT=%s\n' "${CLOUDFLARED_MEM_LIMIT:-128m}"
+              printf 'EXECUTIONS_MAX_AGE=%s\n'  "${EXECUTIONS_MAX_AGE:-1440}"
+              printf 'EXECUTIONS_MAX_COUNT=%s\n' "${EXECUTIONS_MAX_COUNT:-35000}"
+              printf 'BACKBLAZE_KEY_ID=%s\n'   "${BACKBLAZE_KEY_ID:-}"
+              printf 'BACKBLAZE_APPLICATION_KEY=%s\n'  "${BACKBLAZE_APPLICATION_KEY:-}"
+              printf 'RESEND_API_KEY=%s\n'     "${RESEND_API_KEY:-}"
+              printf 'RESEND_FROM_EMAIL=%s\n'  "${RESEND_FROM_EMAIL:-}"
+              printf 'HEALTH_PING_URL=%s\n'     "${HEALTH_PING_URL:-}"
+              printf 'DEVELOPER_EMAIL=%s\n'     "${DEVELOPER_EMAIL:-}"
+              printf 'N8N_LOG_LEVEL=%s\n'      "${N8N_LOG_LEVEL:-info}"
+            } > .env
+            chmod 600 .env
+            # Plaintext secrets — remove on ANY exit (die/pull-fail), not just success.
+            trap 'rm -f .env' EXIT
+
+            _COMPOSE_ARGS=$(bash scripts/lib/compose-args.sh) || die "compose-args.sh failed"
+            read -ra _COMPOSE_ARGS_ARR <<< "$_COMPOSE_ARGS"
+
+            echo "-> Pulling images (current stack stays up)..."
+            # Pull BEFORE down — a failed pull must never leave the stack stopped.
+            if ! docker compose "${_COMPOSE_ARGS_ARR[@]}" pull 2>&1; then
+              echo "❌ docker compose pull failed — leaving the running stack untouched (no downtime)." >&2
+              exit 1
+            fi
+
+            echo "-> Stopping containers..."
+            docker compose "${_COMPOSE_ARGS_ARR[@]}" down 2>&1
+
+            find scripts -type f -name '*.sh' -exec chmod +x {} +
+            echo "-> Starting containers..."
+            docker compose "${_COMPOSE_ARGS_ARR[@]}" up -d --wait --wait-timeout 600 --remove-orphans 2>&1 || die "docker compose up failed or a service never became healthy"
+            echo "-> Securing environment..."
+            grep -E "^(DB_USER|DB_NAME|BACKUP_PASSWORD|PROJECT_NAME|DISPLAY_TZ|N8N_API_KEY|N8N_LOCAL_API_URL|GITHUB_PERSONAL_ACCESS_TOKEN|GITHUB_REPO|GITHUB_BRANCH|TUNNEL_TOKEN|HEALTH_PING_URL|RESEND_API_KEY|RESEND_FROM_EMAIL)=" .env > .backup_creds
+            printf 'RESTIC_REPOSITORY=/root/db-backups/%s\n' "${PROJECT_NAME}" >> .backup_creds
+            printf 'DEVELOPER_EMAIL=%s\n' "${DEVELOPER_EMAIL}" >> .backup_creds
+            printf 'ALERT_DISK_THRESHOLD_MEDIUM=%s\n' "${ALERT_DISK_THRESHOLD_MEDIUM:-85}" >> .backup_creds
+            printf 'ALERT_DISK_THRESHOLD_HIGH=%s\n' "${ALERT_DISK_THRESHOLD_HIGH:-95}" >> .backup_creds
+            if [ -n "${BACKBLAZE_KEY_ID}" ] && [ -n "${BACKBLAZE_BUCKET}" ]; then
+              grep -E "^(BACKBLAZE_KEY_ID|BACKBLAZE_APPLICATION_KEY)=" .env >> .backup_creds || true
+              printf 'RESTIC_REPOSITORY_BACKBLAZE=rclone:b2:%s\n' "${BACKBLAZE_BUCKET}" >> .backup_creds
+            fi
+            chmod 600 .backup_creds
+            rm -f .env
+
+            # Install rclone when B2 is configured (restic's b2: backend uses v1 API, deprecated).
+            # Creds are passed via RCLONE_CONFIG_B2_* env at call time, not via rclone.conf.
+            if [ -n "${BACKBLAZE_KEY_ID}" ] && [ -n "${BACKBLAZE_BUCKET}" ]; then
+              bash /root/n8n/scripts/database/ensure-rclone.sh || die "ensure-rclone failed"
+            fi
+
+            echo "-> Waiting for n8n API to come online (up to 90s)..."
+            N8N_READY=0
+            for i in $(seq 1 18); do
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                "http://localhost:5678/api/v1/workflows" \
+                -H "X-N8N-API-KEY: ${N8N_API_KEY}" 2>/dev/null)
+              if [ "$HTTP_STATUS" = "200" ]; then
+                echo "   ✅ n8n API ready after $((i * 5))s"
+                N8N_READY=1
+                break
+              elif [ "$HTTP_STATUS" = "401" ]; then
+                echo "   ⚠️  n8n is up but returned 401 Unauthorized after $((i * 5))s."
+                echo "      Likely cause: containers were recreated and the API key was reset."
+                echo "      Fix: n8n UI → Settings → API → create a new key,"
+                echo "      then update N8N_API_KEY in .env.sops.yaml ('npm run edit-env') and redeploy."
+                break
+              fi
+              sleep 5
+            done
+            if [ "$N8N_READY" = "0" ] && [ "$HTTP_STATUS" != "401" ]; then
+              echo "   ⚠️  n8n did not respond within 90s (last status: ${HTTP_STATUS:-none}). Attempting push anyway..."
+            fi
+
+            echo "-> Ingesting workflows from disk into n8n DB..."
+            # In full mode this is mid-block; without the guard a non-zero exit is reset by the
+            # next command and the push failure ships a green deploy (workflows-mode is loud only
+            # because the push is its last command).
+            N8N_API_KEY="${N8N_API_KEY}" N8N_LOCAL_API_URL="${N8N_LOCAL_API_URL}" DELETED_WORKFLOWS="${DELETED_WORKFLOWS}" bash scripts/sync-workflows.sh --push || die "workflow push to n8n failed"
+
+            DISPLAY_TZ="${DISPLAY_TZ}" bash /root/n8n/scripts/install-crons.sh || die "install-crons failed"
+
+      - name: Clean stale workflow JSON and prompts on VPS
+        if: steps.changes.outputs.deploy_mode == 'workflows'
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+        with:
+          host: ${{ env.N8N_VPS_IP }}
+          username: ${{ env.N8N_VPS_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          fingerprint: ${{ env.N8N_VPS_HOST_FINGERPRINT }}
+          command_timeout: 20m
+          script: |
+            mkdir -p ~/n8n/workflows ~/n8n/ai-system-prompts
+            rm -f ~/n8n/workflows/*.json
+            rm -f ~/n8n/ai-system-prompts/*.md ~/n8n/ai-system-prompts/*.txt
+
+      - name: Sync Workflow and Prompt Files to VPS
+        if: steps.changes.outputs.deploy_mode == 'workflows'
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345  # v1.0.0
+        with:
+          host: ${{ env.N8N_VPS_IP }}
+          username: ${{ env.N8N_VPS_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          fingerprint: ${{ env.N8N_VPS_HOST_FINGERPRINT }}
+          command_timeout: 20m
+          source: "n8n/workflows,n8n/ai-system-prompts"
+          target: "~/n8n/"
+          strip_components: 1
+          # rm: true would wipe non-JSON files too — use the *.json-only step above.
+          rm: false
+
+      - name: Push Workflows to n8n API
+        if: steps.changes.outputs.deploy_mode == 'workflows'
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
+        env:
+          # Secrets flow from $GITHUB_ENV via envs:; only the step output needs env:.
+          DELETED_WORKFLOWS: ${{ steps.changes.outputs.deleted_workflows }}
+        with:
+          host: ${{ env.N8N_VPS_IP }}
+          username: ${{ env.N8N_VPS_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          fingerprint: ${{ env.N8N_VPS_HOST_FINGERPRINT }}
+          command_timeout: 30m
+          envs: N8N_API_KEY,N8N_LOCAL_API_URL,GITHUB_PERSONAL_ACCESS_TOKEN,DB_USER,DB_NAME,BACKUP_PASSWORD,RESEND_API_KEY,RESEND_FROM_EMAIL,HEALTH_PING_URL,BACKBLAZE_KEY_ID,BACKBLAZE_APPLICATION_KEY,BACKBLAZE_BUCKET,DELETED_WORKFLOWS
+          script: |
+            die() { echo "❌ deploy: $*" >&2; exit 1; }
+            # Same order in every holder or they can deadlock. Earlier cleanup/SCP steps are separate SSH sessions and stay unlocked.
+            exec 8>/root/n8n/.backup.lock || die "cannot open backup lock"
+            flock -w 600 8 || die "backup/restore still running after 10 min — retry the deploy"
+            exec 9>/root/n8n/.poll-publish.lock || die "cannot open poll lock"
+            flock -w 600 9 || die "publish poll still running after 10 min — retry the deploy"
+            # Refresh rotatable keys in .backup_creds without a full deploy.
+            # awk -F= literal $1==k mirrors prompts.sh upsert_env — regex-metachar safe.
+            upsert_cred() {
+              local key="$1" val="$2"
+              local _tmp; _tmp=$(mktemp)
+              awk -F= -v k="$key" '$1 != k' ~/n8n/.backup_creds 2>/dev/null > "$_tmp" || true
+              printf '%s=%s\n' "$key" "$val" >> "$_tmp"
+              mv "$_tmp" ~/n8n/.backup_creds
+              chmod 600 ~/n8n/.backup_creds
+            }
+            delete_cred() {
+              local key="$1"
+              local _tmp; _tmp=$(mktemp)
+              awk -F= -v k="$key" '$1 != k' ~/n8n/.backup_creds 2>/dev/null > "$_tmp" || true
+              mv "$_tmp" ~/n8n/.backup_creds
+              chmod 600 ~/n8n/.backup_creds
+            }
+            upsert_cred N8N_API_KEY "${N8N_API_KEY}"
+            upsert_cred N8N_LOCAL_API_URL "${N8N_LOCAL_API_URL}"
+            upsert_cred GITHUB_PERSONAL_ACCESS_TOKEN "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+            upsert_cred DB_USER "${DB_USER}"
+            # Purges the value earlier deploys left behind; nothing on the VPS reads it.
+            delete_cred DB_PASSWORD
+            upsert_cred DB_NAME "${DB_NAME}"
+            upsert_cred BACKUP_PASSWORD "${BACKUP_PASSWORD}"
+            upsert_cred RESEND_API_KEY "${RESEND_API_KEY}"
+            upsert_cred RESEND_FROM_EMAIL "${RESEND_FROM_EMAIL}"
+            upsert_cred HEALTH_PING_URL "${HEALTH_PING_URL}"
+            if [ -n "${BACKBLAZE_KEY_ID}" ] && [ -n "${BACKBLAZE_BUCKET}" ]; then
+              upsert_cred BACKBLAZE_KEY_ID "${BACKBLAZE_KEY_ID}"
+              upsert_cred BACKBLAZE_APPLICATION_KEY "${BACKBLAZE_APPLICATION_KEY}"
+              upsert_cred RESTIC_REPOSITORY_BACKBLAZE "rclone:b2:${BACKBLAZE_BUCKET}"
+              bash /root/n8n/scripts/database/ensure-rclone.sh || die "ensure-rclone failed"
+            else
+              delete_cred BACKBLAZE_KEY_ID
+              delete_cred BACKBLAZE_APPLICATION_KEY
+              delete_cred RESTIC_REPOSITORY_BACKBLAZE
+            fi
+            echo "-> Pushing workflow changes to n8n API..."
+            N8N_API_KEY="${N8N_API_KEY}" N8N_LOCAL_API_URL="${N8N_LOCAL_API_URL}" DELETED_WORKFLOWS="${DELETED_WORKFLOWS}" bash ~/n8n/scripts/sync-workflows.sh --push || die "workflow push to n8n failed"

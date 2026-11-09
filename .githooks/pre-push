@@ -1,0 +1,61 @@
+#!/bin/bash
+# Watcher failures must never block a push.
+set -u
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+WATCH="$ROOT/scripts/watch-deploy.sh"
+[ -x "$WATCH" ] || exit 0
+
+# pre-push feeds "<localref> <localsha> <remoteref> <remotesha>" lines on stdin.
+_sha=""
+_got_stdin=0
+while read -r _lref _lsha _rref _rsha; do
+  _got_stdin=1
+  [ "$_rref" = "refs/heads/main" ] || continue
+  case "$_lsha" in
+    ''|0000000000000000000000000000000000000000) ;;   # branch deletion
+    *) _sha="$_lsha" ;;
+  esac
+done
+
+# GUI clients (e.g. GitKraken) may not feed stdin — fall back to HEAD if on main.
+if [ "$_got_stdin" = 0 ] && [ "$(git symbolic-ref --short HEAD 2>/dev/null)" = "main" ]; then
+  _sha="$(git rev-parse HEAD 2>/dev/null)"
+fi
+[ -n "$_sha" ] || exit 0
+
+GIT_DIR="$(git rev-parse --git-dir)"
+LOG="$GIT_DIR/push-watch.log"
+REQUEST="$GIT_DIR/watch-deploy.request"
+PIDFILE="$GIT_DIR/watch-deploy.pid"
+
+# Hand the pushed SHA to the watcher via a request file. A persistent --loop
+# watcher (one Terminal window) re-reads this on each push, so the same window
+# is reused instead of opening a new one every time.
+printf '%s\n' "$_sha" > "$REQUEST"
+
+# Stay silent on stdout/stderr: GUI clients (GitKraken) pop a dialog for any
+# hook output, and only show it after the hook returns (no live stream).
+_fallback() { nohup bash "$WATCH" --sha "$_sha" >"$LOG" 2>&1 & disown 2>/dev/null || true; }
+
+# A loop watcher already running? It will pick up the request — don't open a window.
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+  exit 0
+fi
+
+# Otherwise open ONE Terminal window running the persistent loop. Via a generated
+# .command file + `open` (LaunchServices), not AppleScript `tell application
+# "Terminal"` — the latter triggers a macOS prompt asking GitKraken for permission
+# to *control* Terminal. Fall back to a detached background watcher if no `open`.
+if command -v open >/dev/null 2>&1; then
+  CMD_FILE="$GIT_DIR/watch-deploy.command"
+  cat > "$CMD_FILE" <<EOF
+#!/bin/bash
+cd "$ROOT" && exec bash scripts/watch-deploy.sh --loop
+EOF
+  chmod +x "$CMD_FILE"
+  open "$CMD_FILE" >/dev/null 2>&1 || _fallback
+else
+  _fallback
+fi
+exit 0

@@ -1,0 +1,3 @@
+creation_rules:
+  - path_regex: \.env(\.sops\.yaml)?$
+    age: <PUBLIC_AGE_KEY_HERE>

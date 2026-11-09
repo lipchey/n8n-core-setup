@@ -1,0 +1,51 @@
+.idea/
+.vscode/
+.DS_Store
+**/.DS_Store
+
+# Sensitive — never commit. .env.config (per-project), .env.example and .env.sops.yaml are tracked.
+.env
+.env.local
+# Developer-global sensitive keys (HEALTHCHECKS_API_KEY, etc.) — local only.
+.env.developer
+# Plaintext variants are unsafe unless explicitly shared.
+.env.*
+!.env.config
+!.env.example
+!.env.developer.example
+!.env.sops.yaml
+
+*.crt
+node_modules
+
+# Runtime secrets and logs — never commit
+.backup_creds
+
+# Per-instance n8n MCP config — contains a Bearer JWT + CF service-token secret.
+.mcp.json
+
+# Codex per-repo MCP config + CODEX_HOME runtime dir (same secrets as .mcp.json).
+.codex/
+
+# Developer's local test fixtures — DO NOT delete or modify.
+# Also: .env.old (already covered above).
+.env.config.old
+.env.old
+*.log
+id_rsa
+id_ed25519
+id_ecdsa
+*.pem
+*.key
+*.age
+*.dec
+*.p12
+*.pfx
+
+# Local AI-agent harness config — never tracked.
+.claude/
+.codegraph/
+
+# Machine-specific local runbooks / scratch notes (real IPs, per-run values) —
+# not boilerplate knowledge, never tracked.
+*.local.md

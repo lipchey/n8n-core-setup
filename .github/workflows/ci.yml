@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '22'
+
+      - name: Install check tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git jq python3 shellcheck
+
+      - name: Check shell files
+        run: |
+          while IFS= read -r -d '' file; do
+            bash -n "$file"
+            shellcheck -S warning "$file"
+          done < <(find . -type f \( -name '*.sh' -o -path './.githooks/*' \) ! -path './.git/*' -print0)
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Validate compose
+        run: |
+          cp .env.example "$RUNNER_TEMP/compose.env"
+          cat >> "$RUNNER_TEMP/compose.env" <<'EOF'
+          PROJECT_NAME=ci-example
+          WEBHOOK_URL=https://n8n.example.com/
+          DEVELOPER_EMAIL=ci@example.com
+          TUNNEL_TOKEN=ci-placeholder
+          EOF
+          docker compose --env-file "$RUNNER_TEMP/compose.env" -f n8n/docker-compose.yml config -q
+
+      - name: Validate workflow JSON
+        run: |
+          for file in n8n/workflows/*.json; do
+            jq -e . "$file" > /dev/null
+          done
